@@ -1,0 +1,6 @@
+# Generated executable and release archive
+/ArkCursorPatch.exe
+/dist/
+
+# Runtime backup
+/backup/

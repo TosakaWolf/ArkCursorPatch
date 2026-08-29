@@ -1,0 +1,66 @@
+{
+  "package_name": "ArkCursorPatch",
+  "purpose": "Null the three PCCursorRuntimeConfig Texture2D references so Unity can retain/reset to the system default cursor.",
+  "game_content_version": "76.0.0",
+  "relative_target": "Arknights_Data\\sharedassets0.assets",
+  "source_file_size": 428272,
+  "source_sha256": "3f2d419d79abffd2a61b1e7e620397dc64ca6e605456fd6ba80a5b856406d4db",
+  "patched_sha256": "1f59763fed9ead5b026b774604f25c9dd2efe8f888c2b9759aeb59251a711912",
+  "pccursor_runtime_config_path_id": 28,
+  "patch_records": [
+    {
+      "tier": "small",
+      "texture_path_id": 11,
+      "absolute_file_offset": 428216,
+      "object_raw_offset": 64,
+      "expected_hex": "0b00000000000000",
+      "replacement_hex": "0000000000000000"
+    },
+    {
+      "tier": "medium",
+      "texture_path_id": 7,
+      "absolute_file_offset": 428236,
+      "object_raw_offset": 84,
+      "expected_hex": "0700000000000000",
+      "replacement_hex": "0000000000000000"
+    },
+    {
+      "tier": "large",
+      "texture_path_id": 13,
+      "absolute_file_offset": 428256,
+      "object_raw_offset": 104,
+      "expected_hex": "0d00000000000000",
+      "replacement_hex": "0000000000000000"
+    }
+  ],
+  "actual_changed_byte_count": 3,
+  "changed_byte_offsets": [
+    428216,
+    428236,
+    428256
+  ],
+  "static_verification": {
+    "unity_object_count": 28,
+    "config_path_id": 28,
+    "config_type": "MonoBehaviour",
+    "config_raw_size": 120,
+    "null_reference_checks": [
+      {
+        "tier": "small",
+        "raw_offset": 64,
+        "texture_path_id_after": 0
+      },
+      {
+        "tier": "medium",
+        "raw_offset": 84,
+        "texture_path_id_after": 0
+      },
+      {
+        "tier": "large",
+        "raw_offset": 104,
+        "texture_path_id_after": 0
+      }
+    ]
+  },
+  "warning": "The game's custom Cursor.SetCursorWithSize wrapper has not been executed. If it dereferences a null texture without checking, the patch may not behave as intended. Restore is provided."
+}

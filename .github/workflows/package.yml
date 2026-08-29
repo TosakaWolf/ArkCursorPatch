@@ -1,0 +1,52 @@
+name: Package Windows amd64
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Windows amd64
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      GOOS: windows
+      GOARCH: amd64
+      CGO_ENABLED: "0"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build and package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          go build -trimpath -ldflags '-s -w' -o dist\ArkCursorPatch.exe .
+
+          $packageDir = Join-Path $env:RUNNER_TEMP 'ArkCursorPatch-windows-amd64'
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          Copy-Item -LiteralPath dist\ArkCursorPatch.exe -Destination $packageDir
+          Copy-Item -LiteralPath README.md -Destination $packageDir
+          Copy-Item -LiteralPath README.en.md -Destination $packageDir
+          Copy-Item -LiteralPath patch_manifest.json -Destination $packageDir
+          Compress-Archive -Path "$packageDir\*" -DestinationPath dist\ArkCursorPatch-windows-amd64.zip -CompressionLevel Optimal
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ArkCursorPatch-windows-amd64
+          path: dist/ArkCursorPatch-windows-amd64.zip
+          if-no-files-found: error
+          compression-level: 0
