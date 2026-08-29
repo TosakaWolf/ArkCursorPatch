@@ -16,8 +16,7 @@ The tool finds the game automatically. If detection fails, set the game director
 ## Safety and recovery
 
 - Content version `76.0.0` uses exact verification. Other versions use cursor-configuration detection; changes are allowed only when the match is unique and structurally complete.
-- The game file to back up is `Arknights_Data\sharedassets0.assets`, relative to the game root.
-- Before applying changes, the tool automatically saves this file in the `backup` folder beside the program.
+- Back up `Arknights_Data\sharedassets0.assets` under the game root; the tool also saves it to `backup` before applying changes.
 - The written file is verified, and automatic recovery is attempted if writing fails.
 - The tool does not include complete game assets and does not start the game or launcher.
 
