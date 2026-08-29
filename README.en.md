@@ -2,24 +2,22 @@
 
 # Arknights Cursor Patch
 
-Disables the custom cursor image in Arknights PC and uses the current Windows system cursor. Tutorial click and drag indicators are not affected.
+Uses the Windows system cursor in Arknights PC without modifying game files.
 
 ## Use
 
-1. Fully close the game and Hypergryph Launcher.
-2. Run `ArkCursorPatch.exe`.
-3. Confirm the game directory and status shown on the dashboard, then select **Apply cursor replacement**.
-4. Select **Restore original** to revert the change.
+1. Run `ArkCursorPatch.exe`.
+2. Select **Start system cursor mode** and keep the tool running.
+3. Launch the game normally. It also works when the game is already running.
 
-The tool finds the game automatically. If detection fails, set the game directory from the dashboard.
+If automatic detection fails, set the game directory in the tool.
 
-## Safety and recovery
+## Safety
 
-- Content version `76.0.0` uses exact verification. Other versions use cursor-configuration detection; changes are allowed only when the match is unique and structurally complete.
-- Back up `Arknights_Data\sharedassets0.assets` under the game root; the tool also saves it to `backup` before applying changes.
-- The written file is verified, and automatic recovery is attempted if writing fails.
-- The tool does not include complete game assets and does not start the game or launcher.
+- The tool requests administrator privileges, disables the game's drawn cursor at runtime, and selects the Windows system arrow.
+- It does not modify game files or inject a DLL. Changes exist only in the running game process and are restored when the mode stops; restarting the game also clears them.
+- After a game update, the tool refuses to modify anything unless it can identify every target uniquely.
 
 ## Notice
 
-> This tool is provided only for communication and learning. Back up your files first and accept the risks of modifying local game resources.
+> This tool is provided only for communication and learning. Assess and accept the risks of modifying a game process before use.

@@ -40,7 +40,6 @@ jobs:
           Copy-Item -LiteralPath dist\ArkCursorPatch.exe -Destination $packageDir
           Copy-Item -LiteralPath README.md -Destination $packageDir
           Copy-Item -LiteralPath README.en.md -Destination $packageDir
-          Copy-Item -LiteralPath patch_manifest.json -Destination $packageDir
           Compress-Archive -Path "$packageDir\*" -DestinationPath dist\ArkCursorPatch-windows-amd64.zip -CompressionLevel Optimal
 
       - name: Upload package
