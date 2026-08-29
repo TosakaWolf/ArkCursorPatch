@@ -7,11 +7,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	_ "embed"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,6 +25,9 @@ import (
 const (
 	stateOriginal    = "ORIGINAL_READY"
 	statePatched     = "PATCHED"
+	stateCompatible  = "COMPATIBLE_READY"
+	stateCompatPatch = "COMPATIBLE_PATCHED"
+	stateAlreadyNull = "CURSOR_REFERENCES_EMPTY"
 	stateUnsupported = "UNSUPPORTED_VERSION"
 
 	regSZ       = 1
@@ -92,7 +97,13 @@ type appState struct {
 	InstallState     string
 	Size             int64
 	SHA256           string
+	BackupPath       string
 	LastResult       string
+}
+
+type cursorConfigLocation struct {
+	PathIDOffsets []int
+	AlreadyNull   bool
 }
 
 type uiLanguage uint8
@@ -187,7 +198,7 @@ func runMenu(reader *bufio.Reader, packageRoot string, m manifest, canClear bool
 				return err
 			}
 		case "6":
-			if err := showInfoPage(reader, canClear, func() { printTechnicalInfo(state, packageRoot, m) }); errors.Is(err, io.EOF) {
+			if err := showInfoPage(reader, canClear, func() { printTechnicalInfo(state, m) }); errors.Is(err, io.EOF) {
 				return nil
 			} else if err != nil {
 				return err
@@ -247,16 +258,18 @@ func refreshAppState(state *appState, packageRoot string, m manifest) error {
 		state.InstallState = ""
 		state.Size = 0
 		state.SHA256 = ""
+		state.BackupPath = ""
 		return err
 	}
 	target := filepath.Join(gameRoot, m.RelativeTarget)
-	installState, size, hash, err := inspectTarget(target, m)
+	installState, size, hash, backupPath, err := inspectTarget(target, packageRoot, m)
 	if err != nil {
 		state.ResolvedGameRoot = ""
 		state.Target = ""
 		state.InstallState = ""
 		state.Size = 0
 		state.SHA256 = ""
+		state.BackupPath = ""
 		return err
 	}
 	state.ResolvedGameRoot = gameRoot
@@ -264,6 +277,7 @@ func refreshAppState(state *appState, packageRoot string, m manifest) error {
 	state.InstallState = installState
 	state.Size = size
 	state.SHA256 = hash
+	state.BackupPath = backupPath
 	return nil
 }
 
@@ -272,13 +286,16 @@ func performApply(state *appState, packageRoot string, m manifest, reader *bufio
 		return err
 	}
 	switch state.InstallState {
-	case statePatched:
+	case statePatched, stateCompatPatch:
 		state.LastResult = tr("鼠标替换已经应用，无需重复操作。", "Cursor replacement is already applied.")
 		return nil
-	case stateUnsupported:
-		state.LastResult = tr("文件版本不受支持，未进行修改。", "This file version is not supported. No changes were made.")
+	case stateAlreadyNull:
+		state.LastResult = tr("鼠标贴图引用已经为空，无需修改。", "The cursor texture references are already empty. No change is needed.")
 		return nil
-	case stateOriginal:
+	case stateUnsupported:
+		state.LastResult = tr("内容版本不同，且无法安全定位鼠标配置，未进行修改。", "The content version differs and the cursor configuration could not be located safely. No changes were made.")
+		return nil
+	case stateOriginal, stateCompatible:
 	default:
 		return errors.New(tr("当前状态无法应用", "The patch cannot be applied in the current state"))
 	}
@@ -294,15 +311,19 @@ func performApply(state *appState, packageRoot string, m manifest, reader *bufio
 		return nil
 	}
 
-	backupPath := backupPathFor(packageRoot, m)
-	if err := applyPatch(state.Target, backupPath, state.InstallState, m); err != nil {
+	compatibilityAttempt := state.InstallState == stateCompatible
+	if err := applyPatch(state.Target, state.BackupPath, state.InstallState, state.SHA256, m); err != nil {
 		return err
 	}
 	if err := refreshAppState(state, packageRoot, m); err != nil {
 		state.LastResult = tr("应用完成，但状态刷新失败：", "Apply completed, but the status refresh failed: ") + err.Error()
 		return nil
 	}
-	state.LastResult = tr("应用成功，原版备份已保存。", "Applied successfully. The original backup was saved.")
+	if compatibilityAttempt {
+		state.LastResult = tr("兼容修改成功，原文件备份已保存。", "Compatibility patch applied. The original backup was saved.")
+	} else {
+		state.LastResult = tr("应用成功，原版备份已保存。", "Applied successfully. The original backup was saved.")
+	}
 	return nil
 }
 
@@ -314,10 +335,16 @@ func performRestore(state *appState, packageRoot string, m manifest, reader *buf
 	case stateOriginal:
 		state.LastResult = tr("当前已经是原版，无需恢复。", "The file is already original.")
 		return nil
-	case stateUnsupported:
-		state.LastResult = tr("文件版本不受支持，未进行修改。", "This file version is not supported. No changes were made.")
+	case stateCompatible:
+		state.LastResult = tr("当前文件尚未应用兼容修改，无需恢复。", "The compatibility patch has not been applied to this file.")
 		return nil
-	case statePatched:
+	case stateAlreadyNull:
+		state.LastResult = tr("鼠标贴图引用为空，但没有与之匹配的备份，未进行恢复。", "The cursor references are empty, but no matching backup is available. Nothing was restored.")
+		return nil
+	case stateUnsupported:
+		state.LastResult = tr("无法安全识别当前文件，未进行恢复。", "The current file could not be identified safely. Nothing was restored.")
+		return nil
+	case statePatched, stateCompatPatch:
 	default:
 		return errors.New(tr("当前状态无法恢复", "The original file cannot be restored in the current state"))
 	}
@@ -333,7 +360,7 @@ func performRestore(state *appState, packageRoot string, m manifest, reader *buf
 		return nil
 	}
 
-	if err := restorePatch(state.Target, backupPathFor(packageRoot, m), state.InstallState, m); err != nil {
+	if err := restorePatch(state.Target, state.BackupPath, state.InstallState, m); err != nil {
 		return err
 	}
 	if err := refreshAppState(state, packageRoot, m); err != nil {
@@ -350,12 +377,19 @@ func printConfirmation(action string, state appState) {
 	fmt.Println("========================================")
 	fmt.Printf(tr("游戏目录：%s\n", "Game directory: %s\n"), state.ResolvedGameRoot)
 	fmt.Printf(tr("当前状态：%s\n", "Current state: %s\n"), stateLabel(state.InstallState))
+	if state.InstallState == stateCompatible {
+		fmt.Println(tr("内容版本未列入清单，将按唯一结构特征尝试修改。", "This content version is not listed. A unique structure match will be used for the compatibility attempt."))
+	}
 	fmt.Println(tr("请确认游戏和启动器已经完全退出。", "Make sure the game and launcher are fully closed."))
 	fmt.Println()
 }
 
 func backupPathFor(packageRoot string, m manifest) string {
-	return filepath.Join(packageRoot, "backup", "sharedassets0.assets."+m.SourceSHA256+".bak")
+	return backupPathForHash(packageRoot, m.SourceSHA256)
+}
+
+func backupPathForHash(packageRoot, sourceHash string) string {
+	return filepath.Join(packageRoot, "backup", "sharedassets0.assets."+strings.ToLower(sourceHash)+".bak")
 }
 
 func promptGameRoot(state *appState, reader *bufio.Reader, packageRoot string, m manifest, canClear bool) error {
@@ -410,7 +444,7 @@ func printAbout(m manifest) {
 		fmt.Println()
 		fmt.Println("操作前请完全退出游戏和启动器。程序会自动寻找游戏，")
 		fmt.Println("修改前自动备份；需要还原时选择“恢复原版”。")
-		fmt.Println("版本不匹配时不会修改文件。")
+		fmt.Println("其他内容版本只有在鼠标配置可被唯一、安全识别时才会尝试修改。")
 		fmt.Println()
 		fmt.Println("本工具仅供交流与学习。使用前请自行备份，并自行承担")
 		fmt.Println("修改本地游戏资源可能产生的风险。")
@@ -421,13 +455,14 @@ func printAbout(m manifest) {
 	fmt.Println()
 	fmt.Println("Close the game and launcher before making changes. The tool finds the game")
 	fmt.Println("automatically and creates a backup before applying the patch. Choose")
-	fmt.Println("Restore original to revert. Unsupported file versions are not modified.")
+	fmt.Println("Restore original to revert. Other content versions are attempted only when")
+	fmt.Println("the cursor configuration can be identified uniquely and safely.")
 	fmt.Println()
 	fmt.Println("For communication and learning only. Back up your files first and accept")
 	fmt.Println("the risks of modifying local game resources.")
 }
 
-func printTechnicalInfo(state appState, packageRoot string, m manifest) {
+func printTechnicalInfo(state appState, m manifest) {
 	fmt.Println("========================================")
 	fmt.Println(tr(" 技术信息", " Technical information"))
 	fmt.Println("========================================")
@@ -445,7 +480,11 @@ func printTechnicalInfo(state appState, packageRoot string, m manifest) {
 	}
 	fmt.Printf(tr("原版 SHA-256：%s\n", "Original SHA-256: %s\n"), strings.ToUpper(m.SourceSHA256))
 	fmt.Printf(tr("补丁 SHA-256：%s\n", "Patched SHA-256: %s\n"), strings.ToUpper(m.PatchedSHA256))
-	fmt.Printf(tr("备份位置：%s\n", "Backup path: %s\n"), backupPathFor(packageRoot, m))
+	if state.BackupPath == "" {
+		fmt.Println(tr("备份位置：不可用", "Backup path: Not available"))
+	} else {
+		fmt.Printf(tr("备份位置：%s\n", "Backup path: %s\n"), state.BackupPath)
+	}
 }
 
 func confirm(reader *bufio.Reader, prompt string) (bool, error) {
@@ -596,13 +635,13 @@ func resolveGameRoot(explicitRoot, packageRoot string, m manifest) (string, erro
 		if !isRegularFile(target) {
 			continue
 		}
-		hash, err := hashFile(target)
+		installState, _, _, _, err := inspectTarget(target, packageRoot, m)
 		if err != nil {
 			continue
 		}
 		found = append(found, installation{
 			GameRoot: root,
-			State:    stateForHash(hash, m),
+			State:    installState,
 		})
 	}
 
@@ -611,7 +650,7 @@ func resolveGameRoot(explicitRoot, packageRoot string, m manifest) (string, erro
 	}
 	supported := make([]installation, 0)
 	for _, item := range found {
-		if item.State == stateOriginal || item.State == statePatched {
+		if item.State != stateUnsupported {
 			supported = append(supported, item)
 		}
 	}
@@ -627,19 +666,42 @@ func resolveGameRoot(explicitRoot, packageRoot string, m manifest) (string, erro
 	return "", fmt.Errorf(tr("找到 %d 个不受当前补丁支持的安装；请返回菜单选择“设置游戏目录”", "%d installations were found, but none is supported by this patch. Choose Set game directory from the menu."), len(found))
 }
 
-func inspectTarget(target string, m manifest) (string, int64, string, error) {
+func inspectTarget(target, packageRoot string, m manifest) (string, int64, string, string, error) {
 	info, err := os.Stat(target)
 	if err != nil {
-		return "", 0, "", fmt.Errorf(tr("读取目标文件失败 %s: %w", "Failed to read target file %s: %w"), target, err)
+		return "", 0, "", "", fmt.Errorf(tr("读取目标文件失败 %s: %w", "Failed to read target file %s: %w"), target, err)
 	}
 	if !info.Mode().IsRegular() {
-		return "", 0, "", fmt.Errorf(tr("目标不是普通文件：%s", "Target is not a regular file: %s"), target)
+		return "", 0, "", "", fmt.Errorf(tr("目标不是普通文件：%s", "Target is not a regular file: %s"), target)
 	}
 	hash, err := hashFile(target)
 	if err != nil {
-		return "", 0, "", fmt.Errorf(tr("计算目标 SHA-256 失败: %w", "Failed to calculate target SHA-256: %w"), err)
+		return "", 0, "", "", fmt.Errorf(tr("计算目标 SHA-256 失败: %w", "Failed to calculate target SHA-256: %w"), err)
 	}
-	return stateForHash(hash, m), info.Size(), hash, nil
+	knownState := stateForHash(hash, m)
+	if knownState == stateOriginal || knownState == statePatched {
+		return knownState, info.Size(), hash, backupPathFor(packageRoot, m), nil
+	}
+
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return "", 0, "", "", fmt.Errorf(tr("读取目标内容失败: %w", "Failed to read target content: %w"), err)
+	}
+	location, err := locateCursorConfig(data)
+	if err != nil {
+		return stateUnsupported, info.Size(), hash, "", nil
+	}
+	if !location.AlreadyNull {
+		return stateCompatible, info.Size(), hash, backupPathForHash(packageRoot, hash), nil
+	}
+	backupPath, err := findCompatibilityBackup(packageRoot, hash, info.Size())
+	if err != nil {
+		return "", 0, "", "", err
+	}
+	if backupPath != "" {
+		return stateCompatPatch, info.Size(), hash, backupPath, nil
+	}
+	return stateAlreadyNull, info.Size(), hash, "", nil
 }
 
 func stateLabel(state string) string {
@@ -648,25 +710,45 @@ func stateLabel(state string) string {
 		return tr("原版文件，可以应用", "Original file; ready to apply")
 	case statePatched:
 		return tr("鼠标替换已应用", "Cursor replacement applied")
+	case stateCompatible:
+		return tr("内容版本不同，可以兼容尝试", "Different content version; compatibility attempt available")
+	case stateCompatPatch:
+		return tr("兼容修改已应用", "Compatibility patch applied")
+	case stateAlreadyNull:
+		return tr("鼠标贴图引用已经为空", "Cursor texture references are already empty")
 	case stateUnsupported:
-		return tr("文件版本不受支持", "Unsupported file version")
+		return tr("无法安全定位鼠标配置", "Cursor configuration could not be located safely")
 	default:
 		return state
 	}
 }
 
-func applyPatch(target, backupPath, state string, m manifest) error {
-	if state == statePatched {
+func applyPatch(target, backupPath, state, sourceHash string, m manifest) error {
+	if state == statePatched || state == stateCompatPatch {
 		return nil
 	}
-	if state != stateOriginal {
-		return errors.New(tr("拒绝应用：已安装文件不是当前补丁支持的原版", "Apply refused: the installed file is not a supported original"))
+	var patchedPayload []byte
+	var expectedPatchedHash string
+	var err error
+	switch state {
+	case stateOriginal:
+		patchedPayload, err = buildPatchedPayload(target, m)
+		expectedPatchedHash = m.PatchedSHA256
+	case stateCompatible:
+		patchedPayload, err = buildCompatibilityPayload(target)
+		if err == nil {
+			expectedPatchedHash = hashBytes(patchedPayload)
+		}
+	default:
+		return errors.New(tr("拒绝应用：无法安全识别当前文件", "Apply refused: the current file could not be identified safely"))
 	}
-	patchedPayload, err := buildPatchedPayload(target, m)
 	if err != nil {
 		return fmt.Errorf(tr("根据补丁记录生成目标内容失败，目标未修改: %w", "Failed to build the patched content; the target was not changed: %w"), err)
 	}
-	if err := ensureBackup(target, backupPath, m.SourceSHA256); err != nil {
+	if backupPath == "" || len(sourceHash) != 64 {
+		return errors.New(tr("无法确定安全备份位置，目标未修改", "A safe backup path could not be determined; the target was not changed"))
+	}
+	if err := ensureBackup(target, backupPath, sourceHash); err != nil {
 		return fmt.Errorf(tr("创建或校验备份失败，目标未修改: %w", "Failed to create or verify the backup; the target was not changed: %w"), err)
 	}
 
@@ -675,14 +757,14 @@ func applyPatch(target, backupPath, state string, m manifest) error {
 		return fmt.Errorf(tr("读取目标属性失败: %w", "Failed to read target attributes: %w"), err)
 	}
 	if err := atomicInstallBytes(target, patchedPayload, info.Mode()); err != nil {
-		return applyFailureWithRestore(target, backupPath, m, err)
+		return applyFailureWithRestore(target, backupPath, sourceHash, err)
 	}
 	got, err := hashFile(target)
-	if err != nil || got != m.PatchedSHA256 {
+	if err != nil || got != expectedPatchedHash {
 		if err == nil {
-			err = fmt.Errorf(tr("写入后的 SHA-256 为 %s，预期 %s", "SHA-256 after writing is %s; expected %s"), got, m.PatchedSHA256)
+			err = fmt.Errorf(tr("写入后的 SHA-256 为 %s，预期 %s", "SHA-256 after writing is %s; expected %s"), got, expectedPatchedHash)
 		}
-		return applyFailureWithRestore(target, backupPath, m, err)
+		return applyFailureWithRestore(target, backupPath, sourceHash, err)
 	}
 	return nil
 }
@@ -693,6 +775,14 @@ func buildPatchedPayload(target string, m manifest) ([]byte, error) {
 		return nil, err
 	}
 	return applyPatchRecords(original, m)
+}
+
+func buildCompatibilityPayload(target string) ([]byte, error) {
+	original, err := os.ReadFile(target)
+	if err != nil {
+		return nil, err
+	}
+	return applyCompatibilityPatch(original)
 }
 
 func applyPatchRecords(original []byte, m manifest) ([]byte, error) {
@@ -732,25 +822,140 @@ func applyPatchRecords(original []byte, m manifest) ([]byte, error) {
 	return patched, nil
 }
 
-func applyFailureWithRestore(target, backupPath string, m manifest, cause error) error {
+func applyCompatibilityPatch(original []byte) ([]byte, error) {
+	location, err := locateCursorConfig(original)
+	if err != nil {
+		return nil, err
+	}
+	if location.AlreadyNull {
+		return nil, errors.New(tr("鼠标贴图引用已经为空", "Cursor texture references are already empty"))
+	}
+	patched := bytes.Clone(original)
+	for _, offset := range location.PathIDOffsets {
+		clear(patched[offset : offset+8])
+	}
+	return patched, nil
+}
+
+func locateCursorConfig(data []byte) (cursorConfigLocation, error) {
+	name := []byte("PCCursorRuntimeConfig")
+	signature := make([]byte, 4+len(name))
+	binary.LittleEndian.PutUint32(signature[:4], uint32(len(name)))
+	copy(signature[4:], name)
+	for len(signature)%4 != 0 {
+		signature = append(signature, 0)
+	}
+	signature = binary.LittleEndian.AppendUint32(signature, 3)
+
+	start := bytes.Index(data, signature)
+	if start < 0 {
+		return cursorConfigLocation{}, errors.New(tr("未找到 PCCursorRuntimeConfig 结构", "PCCursorRuntimeConfig structure was not found"))
+	}
+	if bytes.Index(data[start+1:], signature) >= 0 {
+		return cursorConfigLocation{}, errors.New(tr("PCCursorRuntimeConfig 结构不唯一", "PCCursorRuntimeConfig structure is not unique"))
+	}
+
+	firstPathID := start + len(signature) + 4
+	offsets := []int{firstPathID, firstPathID + 20, firstPathID + 40}
+	zeroCount := 0
+	for _, offset := range offsets {
+		if offset < 4 || offset+16 > len(data) {
+			return cursorConfigLocation{}, errors.New(tr("PCCursorRuntimeConfig 结构已截断", "PCCursorRuntimeConfig structure is truncated"))
+		}
+		if binary.LittleEndian.Uint32(data[offset-4:offset]) != 0 {
+			return cursorConfigLocation{}, errors.New(tr("鼠标贴图引用不是本地资源", "A cursor texture reference is not local"))
+		}
+		pathID := int64(binary.LittleEndian.Uint64(data[offset : offset+8]))
+		if pathID == 0 {
+			zeroCount++
+		} else if pathID < 0 {
+			return cursorConfigLocation{}, errors.New(tr("鼠标贴图 PathID 无效", "A cursor texture PathID is invalid"))
+		}
+		for _, hotspotOffset := range []int{offset + 8, offset + 12} {
+			hotspot := math.Float32frombits(binary.LittleEndian.Uint32(data[hotspotOffset : hotspotOffset+4]))
+			if math.IsNaN(float64(hotspot)) || math.IsInf(float64(hotspot), 0) || hotspot < 0 || hotspot > 65536 {
+				return cursorConfigLocation{}, errors.New(tr("鼠标热点坐标无效", "A cursor hotspot coordinate is invalid"))
+			}
+		}
+	}
+	if zeroCount != 0 && zeroCount != len(offsets) {
+		return cursorConfigLocation{}, errors.New(tr("鼠标贴图引用处于不完整状态", "Cursor texture references are in a partial state"))
+	}
+	return cursorConfigLocation{PathIDOffsets: offsets, AlreadyNull: zeroCount == len(offsets)}, nil
+}
+
+func findCompatibilityBackup(packageRoot, patchedHash string, targetSize int64) (string, error) {
+	backupDir := filepath.Join(packageRoot, "backup")
+	entries, err := os.ReadDir(backupDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf(tr("读取备份目录失败: %w", "Failed to read the backup directory: %w"), err)
+	}
+	const prefix = "sharedassets0.assets."
+	const suffix = ".bak"
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+			continue
+		}
+		sourceHash := name[len(prefix) : len(name)-len(suffix)]
+		if len(sourceHash) != 64 {
+			continue
+		}
+		if _, err := hex.DecodeString(sourceHash); err != nil {
+			continue
+		}
+		path := filepath.Join(backupDir, name)
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() != targetSize {
+			continue
+		}
+		original, err := os.ReadFile(path)
+		if err != nil || hashBytes(original) != strings.ToLower(sourceHash) {
+			continue
+		}
+		patched, err := applyCompatibilityPatch(original)
+		if err == nil && hashBytes(patched) == patchedHash {
+			return path, nil
+		}
+	}
+	return "", nil
+}
+
+func applyFailureWithRestore(target, backupPath, sourceHash string, cause error) error {
 	currentHash, hashErr := hashFile(target)
-	if hashErr == nil && currentHash == m.SourceSHA256 {
+	if hashErr == nil && currentHash == sourceHash {
 		return fmt.Errorf(tr("应用失败，目标仍保持原版: %w", "Apply failed; the target remains original: %w"), cause)
 	}
-	if restoreErr := installVerifiedBackup(target, backupPath, m.SourceSHA256); restoreErr != nil {
+	if restoreErr := installVerifiedBackup(target, backupPath, sourceHash); restoreErr != nil {
 		return fmt.Errorf(tr("应用失败，且自动恢复也失败（请保留备份并手动处理）：应用错误: %v；恢复错误: %w", "Apply failed, and automatic recovery also failed. Keep the backup and restore manually. Apply error: %v; restore error: %w"), cause, restoreErr)
 	}
 	return fmt.Errorf(tr("应用失败，已自动恢复原版: %w", "Apply failed; the original was restored automatically: %w"), cause)
 }
 
 func restorePatch(target, backupPath, state string, m manifest) error {
-	if state == stateOriginal {
+	if state == stateOriginal || state == stateCompatible {
 		return nil
 	}
-	if state != statePatched {
+	var sourceHash string
+	switch state {
+	case statePatched:
+		sourceHash = m.SourceSHA256
+	case stateCompatPatch:
+		if backupPath == "" {
+			return errors.New(tr("找不到兼容修改对应的备份", "The backup for this compatibility patch was not found"))
+		}
+		var err error
+		sourceHash, err = hashFile(backupPath)
+		if err != nil {
+			return fmt.Errorf(tr("读取兼容修改备份失败: %w", "Failed to read the compatibility backup: %w"), err)
+		}
+	default:
 		return errors.New(tr("拒绝恢复：已安装文件既不是受支持的原版，也不是本补丁版本", "Restore refused: the installed file is neither a supported original nor this patch version"))
 	}
-	if err := installVerifiedBackup(target, backupPath, m.SourceSHA256); err != nil {
+	if err := installVerifiedBackup(target, backupPath, sourceHash); err != nil {
 		return fmt.Errorf(tr("恢复失败: %w", "Restore failed: %w"), err)
 	}
 	return nil

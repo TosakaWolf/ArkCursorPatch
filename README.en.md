@@ -15,7 +15,7 @@ The tool finds the game automatically. If detection fails, set the game director
 
 ## Safety and recovery
 
-- Supports content version `76.0.0`; unsupported file versions are not modified.
+- Content version `76.0.0` uses exact verification. Other versions use cursor-configuration detection; changes are allowed only when the match is unique and structurally complete.
 - The original file is saved in the `backup` folder beside the program before changes are applied.
 - The written file is verified, and automatic recovery is attempted if writing fails.
 - The tool does not include complete game assets and does not start the game or launcher.
