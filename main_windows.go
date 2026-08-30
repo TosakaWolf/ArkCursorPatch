@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strings"
 	"syscall"
-	"time"
 	"unsafe"
 )
 
@@ -94,7 +93,7 @@ func runMenu(reader *bufio.Reader, packageRoot string, canClear bool) error {
 	if err := refreshAppState(&state, packageRoot); err != nil {
 		state.LastResult = tr("自动检查失败：", "Automatic check failed: ") + err.Error()
 	} else {
-		state.LastResult = tr("已就绪，可以启动系统指针模式。", "Ready to start system cursor mode.")
+		state.LastResult = tr("已就绪。请先启动游戏，再应用系统指针。", "Ready. Start the game before applying the system cursor.")
 	}
 
 	for {
@@ -111,36 +110,57 @@ func runMenu(reader *bufio.Reader, packageRoot string, canClear bool) error {
 		switch choice {
 		case "1":
 			if err := refreshAppState(&state, packageRoot); err != nil {
-				state.LastResult = tr("无法启动：", "Could not start: ") + err.Error()
+				state.LastResult = tr("无法应用：", "Could not apply: ") + err.Error()
 				continue
 			}
 			targetExe := filepath.Join(state.ResolvedGameRoot, "Arknights.exe")
-			if err := runCursorMode(reader, targetExe, canClear); errors.Is(err, io.EOF) {
-				return nil
-			} else if err != nil {
-				state.LastResult = tr("系统指针模式失败：", "System cursor mode failed: ") + err.Error()
-			} else {
-				state.LastResult = tr("系统指针模式已停止。", "System cursor mode stopped.")
+			active, err := applyCursorOnce(targetExe)
+			if err != nil {
+				state.LastResult = tr("应用失败：", "Apply failed: ") + err.Error()
+				continue
 			}
+			clearScreen(canClear)
+			fmt.Println(tr("系统指针已应用到当前游戏进程，ArkCursorPatch 已退出。", "The system cursor was applied to the running game. ArkCursorPatch has exited."))
+			if !active {
+				fmt.Println(tr("切换到游戏窗口后生效；重启游戏即可还原。", "It takes effect when the game enters the foreground. Restart the game to restore the original cursor."))
+			} else {
+				fmt.Println(tr("重启游戏即可还原。", "Restart the game to restore the original cursor."))
+			}
+			return nil
 		case "2":
+			if err := refreshAppState(&state, packageRoot); err != nil {
+				state.LastResult = tr("无法恢复：", "Could not restore: ") + err.Error()
+			} else {
+				targetExe := filepath.Join(state.ResolvedGameRoot, "Arknights.exe")
+				restored, err := restoreCursorOnce(targetExe)
+				switch {
+				case err != nil:
+					state.LastResult = tr("恢复失败：", "Restore failed: ") + err.Error()
+				case restored:
+					state.LastResult = tr("已恢复当前游戏的原版指针。", "The original cursor was restored in the running game.")
+				default:
+					state.LastResult = tr("当前游戏未检测到本工具的运行时补丁。", "No ArkCursorPatch runtime patch was detected in the running game.")
+				}
+			}
+		case "3":
 			if err := refreshAppState(&state, packageRoot); err != nil {
 				state.LastResult = tr("检查失败：", "Check failed: ") + err.Error()
 			} else {
 				state.LastResult = tr("检查完成，游戏目录有效。", "Check complete. The game directory is valid.")
 			}
-		case "3":
+		case "4":
 			if err := promptGameRoot(&state, reader, packageRoot, canClear); errors.Is(err, io.EOF) {
 				return nil
 			} else if err != nil {
 				state.LastResult = tr("目录设置失败：", "Game directory setup failed: ") + err.Error()
 			}
-		case "4":
+		case "5":
 			if err := showInfoPage(reader, canClear, printAbout); errors.Is(err, io.EOF) {
 				return nil
 			} else if err != nil {
 				return err
 			}
-		case "5":
+		case "6":
 			if err := showInfoPage(reader, canClear, func() { printTechnicalInfo(state) }); errors.Is(err, io.EOF) {
 				return nil
 			} else if err != nil {
@@ -151,7 +171,7 @@ func runMenu(reader *bufio.Reader, packageRoot string, canClear bool) error {
 			fmt.Println(tr("ArkCursorPatch 已退出。", "ArkCursorPatch exited."))
 			return nil
 		default:
-			state.LastResult = tr("无效选项，请输入 0 至 5。", "Invalid option. Enter a number from 0 to 5.")
+			state.LastResult = tr("无效选项，请输入 0 至 6。", "Invalid option. Enter a number from 0 to 6.")
 		}
 	}
 }
@@ -182,11 +202,12 @@ func renderDashboard(state appState) {
 	fmt.Printf(tr("当前状态：%s\n", "Current state: %s\n"), status)
 	fmt.Printf(tr("上次结果：%s\n", "Last result: %s\n"), lastResult)
 	fmt.Println("----------------------------------------")
-	fmt.Println(tr("1. 启动系统指针模式", "1. Start system cursor mode"))
-	fmt.Println(tr("2. 重新检查状态", "2. Check status"))
-	fmt.Println(tr("3. 设置游戏目录", "3. Set game directory"))
-	fmt.Println(tr("4. 查看使用说明", "4. Help"))
-	fmt.Println(tr("5. 查看技术信息", "5. Technical information"))
+	fmt.Println(tr("1. 应用系统指针并退出", "1. Apply system cursor and exit"))
+	fmt.Println(tr("2. 恢复当前游戏指针", "2. Restore the current game cursor"))
+	fmt.Println(tr("3. 重新检查状态", "3. Check status"))
+	fmt.Println(tr("4. 设置游戏目录", "4. Set game directory"))
+	fmt.Println(tr("5. 查看使用说明", "5. Help"))
+	fmt.Println(tr("6. 查看技术信息", "6. Technical information"))
 	fmt.Println(tr("0. 退出", "0. Exit"))
 	fmt.Print(tr("请选择：", "Select: "))
 }
@@ -199,73 +220,6 @@ func refreshAppState(state *appState, packageRoot string) error {
 	}
 	state.ResolvedGameRoot = gameRoot
 	return nil
-}
-
-func runCursorMode(reader *bufio.Reader, targetExe string, canClear bool) error {
-	keeper, err := newCursorKeeper()
-	if err != nil {
-		return err
-	}
-	defer keeper.close()
-
-	input := make(chan error, 1)
-	go func() {
-		_, readErr := readLine(reader)
-		input <- readErr
-	}()
-
-	lastCount := -1
-	lastActive := -1
-	lastError := ""
-	refresh := func() {
-		count, active, applyErr := keeper.apply(targetExe)
-		errorText := ""
-		if applyErr != nil {
-			errorText = applyErr.Error()
-		}
-		if count == lastCount && active == lastActive && errorText == lastError {
-			return
-		}
-		lastCount = count
-		lastActive = active
-		lastError = errorText
-		clearScreen(canClear)
-		renderCursorMode(targetExe, count, active, applyErr)
-	}
-
-	refresh()
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case readErr := <-input:
-			if restoreErr := keeper.restore(); restoreErr != nil {
-				return restoreErr
-			}
-			return readErr
-		case <-ticker.C:
-			refresh()
-		}
-	}
-}
-
-func renderCursorMode(targetExe string, windowCount, activeCount int, applyErr error) {
-	fmt.Println("========================================")
-	fmt.Println(tr(" 系统指针模式运行中", " System cursor mode is active"))
-	fmt.Println("========================================")
-	fmt.Printf(tr("目标程序：%s\n", "Target executable: %s\n"), targetExe)
-	switch {
-	case applyErr != nil:
-		fmt.Printf(tr("当前状态：应用失败：%v\n", "Status: Failed to apply: %v\n"), applyErr)
-	case windowCount == 0:
-		fmt.Println(tr("当前状态：等待游戏窗口", "Status: Waiting for the game window"))
-	case activeCount == 0:
-		fmt.Println(tr("当前状态：已找到游戏窗口，等待切换到前台", "Status: Game window found; waiting for it to enter the foreground"))
-	default:
-		fmt.Printf(tr("当前状态：系统指针已生效（%d 个前台窗口）\n", "Status: System cursor active for %d foreground window(s)\n"), activeCount)
-	}
-	fmt.Println()
-	fmt.Println(tr("保持本工具运行；按回车键停止。", "Keep this tool running. Press Enter to stop."))
 }
 
 func promptGameRoot(state *appState, reader *bufio.Reader, packageRoot string, canClear bool) error {
@@ -315,17 +269,17 @@ func printAbout() {
 	if currentLanguage == languageChinese {
 		fmt.Println("让《明日方舟》PC 版使用 Windows 系统指针，不修改游戏文件。")
 		fmt.Println()
-		fmt.Println("选择“启动系统指针模式”并保持工具运行；游戏已打开时也可生效。")
+		fmt.Println("先启动游戏，再选择“应用系统指针并退出”。")
 		fmt.Println()
-		fmt.Println("运行期间会修改游戏进程内存；停止模式或重启游戏即可还原。")
+		fmt.Println("补丁仅保留在当前游戏进程中；可用恢复选项或重启游戏还原。")
 		fmt.Println("本工具仅供交流与学习，使用者自行承担相关风险。")
 		return
 	}
 	fmt.Println("Uses the Windows system cursor in Arknights PC without modifying game files.")
 	fmt.Println()
-	fmt.Println("Start system cursor mode and keep the tool running. It also works when the game is already open.")
+	fmt.Println("Start the game, then select Apply system cursor and exit.")
 	fmt.Println()
-	fmt.Println("The mode changes only the running game process; stopping it or restarting the game restores everything.")
+	fmt.Println("The patch remains only in the running game process. Use Restore or restart the game to remove it.")
 	fmt.Println("For communication and learning only. Use at your own risk.")
 }
 
@@ -333,7 +287,7 @@ func printTechnicalInfo(state appState) {
 	fmt.Println("========================================")
 	fmt.Println(tr(" 技术信息", " Technical information"))
 	fmt.Println("========================================")
-	fmt.Println(tr("工作方式：关闭游戏自绘指针，并将 Unity 指针重置为 Windows 系统箭头", "Method: Disables the drawn game cursor and resets Unity to the Windows system arrow"))
+	fmt.Println(tr("工作方式：一次修改当前游戏进程的指针逻辑，工具退出后继续使用系统箭头", "Method: Patches the running game's cursor logic once; the system arrow remains after the tool exits"))
 	fmt.Println(tr("修改范围：仅当前游戏进程内存；不修改游戏文件、不注入 DLL", "Scope: Running game process memory only; no game-file changes or DLL injection"))
 	fmt.Println(tr("版本识别：使用多段代码特征与原始字节共同校验，结果不唯一时拒绝修改", "Version check: Uses multiple code signatures and original-byte checks; ambiguous matches are rejected"))
 	fmt.Println(tr("自动定位：优先读取启动器记录，再检查常见目录和安装注册信息", "Auto detection: Reads launcher records first, then checks common paths and installation registry data"))

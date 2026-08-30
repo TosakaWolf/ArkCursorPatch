@@ -6,16 +6,18 @@ Uses the Windows system cursor in Arknights PC without modifying game files.
 
 ## Use
 
-1. Run `ArkCursorPatch.exe`.
-2. Select **Start system cursor mode** and keep the tool running.
-3. Launch the game normally. It also works when the game is already running.
+1. Start Arknights.
+2. Run `ArkCursorPatch.exe` and select **Apply system cursor and exit**.
+3. The tool exits after applying. The running game continues to use the system cursor.
 
 If automatic detection fails, set the game directory in the tool.
 
+To remove it immediately, run the tool again and select **Restore the current game cursor**. Restarting the game also restores it.
+
 ## Safety
 
-- The tool requests administrator privileges, disables the game's drawn cursor at runtime, and selects the Windows system arrow.
-- It does not modify game files or inject a DLL. Changes exist only in the running game process and are restored when the mode stops; restarting the game also clears them.
+- The tool requests administrator privileges, patches the running game's cursor logic once, and selects the Windows system arrow.
+- It does not modify game files or inject a DLL. The patch exists only in the running game process and disappears completely when the game restarts.
 - After a game update, the tool refuses to modify anything unless it can identify every target uniquely.
 
 ## Notice

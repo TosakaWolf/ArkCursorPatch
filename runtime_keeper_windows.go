@@ -86,14 +86,13 @@ type runtimePatch struct {
 }
 
 type gameSession struct {
-	pid            uint32
-	hwnd           uintptr
-	process        uintptr
-	gameAssembly   uintptr
-	layout         runtimeLayout
-	patches        []runtimePatch
-	lastForeground bool
-	systemCursor   uintptr
+	pid          uint32
+	hwnd         uintptr
+	process      uintptr
+	gameAssembly uintptr
+	layout       runtimeLayout
+	patches      []runtimePatch
+	systemCursor uintptr
 }
 
 type cursorKeeper struct {
@@ -225,36 +224,39 @@ func (keeper *cursorKeeper) apply(targetExe string) (int, int, error) {
 		return 0, 0, err
 	}
 	if hwnd == 0 {
-		if keeper.session != nil && !keeper.session.alive() {
-			keeper.close()
-		}
 		return 0, 0, nil
 	}
-	if keeper.session == nil || keeper.session.pid != pid || !keeper.session.alive() {
-		keeper.close()
-		session, createErr := keeper.openSession(targetExe, hwnd, pid)
-		if createErr != nil {
-			return 1, 0, createErr
-		}
-		keeper.session = session
+	keeper.close()
+	session, err := keeper.openSession(targetExe, hwnd, pid)
+	if err != nil {
+		return 1, 0, err
 	}
-	keeper.session.hwnd = hwnd
+	keeper.session = session
 	foreground, _, _ := rtProcGetForegroundWindow.Call()
-	isForeground := foreground == hwnd
-	needsEnforce := isForeground && (!keeper.session.lastForeground || !keeper.session.systemCursorActive())
-	if needsEnforce {
-		if err := keeper.session.enforceSystemCursor(); err != nil {
-			return 1, 0, err
-		}
-	}
-	keeper.session.lastForeground = isForeground
-	if isForeground && keeper.session.systemCursorActive() {
+	if foreground == hwnd && keeper.session.systemCursorActive() {
 		return 1, 1, nil
 	}
 	return 1, 0, nil
 }
 
 func (keeper *cursorKeeper) openSession(targetExe string, hwnd uintptr, pid uint32) (*gameSession, error) {
+	session, err := keeper.openRawSession(targetExe, hwnd, pid)
+	if err != nil {
+		return nil, err
+	}
+	if err := session.applyPersistentPatches(); err != nil {
+		session.close()
+		return nil, err
+	}
+	if err := session.invokeOnTick(true); err != nil {
+		_ = session.restorePersistentPatches()
+		session.close()
+		return nil, err
+	}
+	return session, nil
+}
+
+func (keeper *cursorKeeper) openRawSession(targetExe string, hwnd uintptr, pid uint32) (*gameSession, error) {
 	gameAssemblyPath := filepath.Join(filepath.Dir(targetExe), "GameAssembly.dll")
 	if !strings.EqualFold(keeper.layoutPath, gameAssemblyPath) {
 		keeper.layoutPath = gameAssemblyPath
@@ -285,24 +287,70 @@ func (keeper *cursorKeeper) openSession(targetExe string, hwnd uintptr, pid uint
 	if process == 0 {
 		return nil, fmt.Errorf(tr("无法访问游戏进程，请允许管理员权限：%v", "Could not access the game process; allow administrator privileges: %v"), openErr)
 	}
-	session := &gameSession{
+	return &gameSession{
 		pid:          pid,
 		hwnd:         hwnd,
 		process:      process,
 		gameAssembly: base,
 		layout:       keeper.layout,
 		systemCursor: keeper.systemCursor,
+	}, nil
+}
+
+func applyCursorOnce(targetExe string) (bool, error) {
+	keeper, err := newCursorKeeper()
+	if err != nil {
+		return false, err
 	}
-	if err := session.applyPersistentPatches(); err != nil {
-		session.close()
-		return nil, err
+	defer keeper.close()
+	count, active, err := keeper.apply(targetExe)
+	if err != nil {
+		return false, err
 	}
-	if err := session.invokeOnTick(true); err != nil {
-		_ = session.restorePersistentPatches()
-		session.close()
-		return nil, err
+	if count == 0 || keeper.session == nil {
+		return false, errors.New(tr("未找到运行中的游戏窗口，请先启动游戏", "No running game window was found. Start the game first"))
 	}
-	return session, nil
+	if err := keeper.session.verifyPersistentPatches(); err != nil {
+		restoreErr := keeper.restore()
+		return false, errors.Join(err, restoreErr)
+	}
+	return active > 0, nil
+}
+
+func restoreCursorOnce(targetExe string) (bool, error) {
+	keeper, err := newCursorKeeper()
+	if err != nil {
+		return false, err
+	}
+	defer keeper.close()
+	return keeper.restoreRunning(targetExe)
+}
+
+func (keeper *cursorKeeper) restoreRunning(targetExe string) (bool, error) {
+	hwnd, pid, err := findTargetWindow(filepath.Clean(targetExe))
+	if err != nil {
+		return false, err
+	}
+	if hwnd == 0 {
+		return false, errors.New(tr("未找到运行中的游戏窗口，请先启动游戏", "No running game window was found. Start the game first"))
+	}
+	keeper.close()
+	session, err := keeper.openRawSession(targetExe, hwnd, pid)
+	if err != nil {
+		return false, err
+	}
+	keeper.session = session
+	patched, err := session.capturePersistentPatches()
+	if err != nil {
+		return false, err
+	}
+	if !patched {
+		return false, nil
+	}
+	if err := keeper.restore(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (keeper *cursorKeeper) restore() error {
@@ -330,7 +378,7 @@ func (keeper *cursorKeeper) close() {
 	}
 }
 
-func (session *gameSession) applyPersistentPatches() error {
+func (session *gameSession) preparePersistentPatches() error {
 	callAddress := session.gameAssembly + uintptr(session.layout.refreshSequenceRVA) + 30
 	setCursorAddress := session.gameAssembly + uintptr(session.layout.setCursorRVA)
 	relative := int64(setCursorAddress) - int64(callAddress+5)
@@ -361,6 +409,13 @@ func (session *gameSession) applyPersistentPatches() error {
 			patched:  patchedCall,
 		},
 	}
+	return nil
+}
+
+func (session *gameSession) applyPersistentPatches() error {
+	if err := session.preparePersistentPatches(); err != nil {
+		return err
+	}
 	for index := range session.patches {
 		patch := &session.patches[index]
 		current, err := readRuntimeBytes(session.process, patch.address, len(patch.original))
@@ -383,6 +438,30 @@ func (session *gameSession) applyPersistentPatches() error {
 		}
 	}
 	return nil
+}
+
+func (session *gameSession) capturePersistentPatches() (bool, error) {
+	if err := session.preparePersistentPatches(); err != nil {
+		return false, err
+	}
+	patched := false
+	for index := range session.patches {
+		patch := &session.patches[index]
+		current, err := readRuntimeBytes(session.process, patch.address, len(patch.original))
+		if err != nil {
+			return false, err
+		}
+		switch {
+		case bytes.Equal(current, patch.patched):
+			patch.applied = true
+			patched = true
+		case bytes.Equal(current, patch.original):
+			patch.applied = false
+		default:
+			return false, fmt.Errorf(tr("游戏运行时代码与已识别版本不一致：%#x (%s)", "The game runtime code differs from the recognized version: %#x (%s)"), patch.address-session.gameAssembly, hex.EncodeToString(current))
+		}
+	}
+	return patched, nil
 }
 
 func (session *gameSession) restorePersistentPatches() error {
@@ -414,7 +493,7 @@ func (session *gameSession) restorePersistentPatches() error {
 	return restoreErr
 }
 
-func (session *gameSession) enforceSystemCursor() error {
+func (session *gameSession) verifyPersistentPatches() error {
 	for _, patch := range session.patches {
 		current, err := readRuntimeBytes(session.process, patch.address, len(patch.patched))
 		if err != nil {
@@ -423,9 +502,6 @@ func (session *gameSession) enforceSystemCursor() error {
 		if !bytes.Equal(current, patch.patched) {
 			return fmt.Errorf(tr("运行时补丁被覆盖：%#x", "A runtime patch was overwritten: %#x"), patch.address-session.gameAssembly)
 		}
-	}
-	if err := session.invokeOnTick(true); err != nil {
-		return err
 	}
 	return nil
 }
